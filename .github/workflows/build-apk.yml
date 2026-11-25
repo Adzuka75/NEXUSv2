@@ -14,31 +14,38 @@ jobs:
   build:
     name: Build NEXUS APK
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      # 1. Download repository
+      # 1. Checkout
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Extract Android project ZIP
+      # 2. Extract Android project
       - name: Extract Android project
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          ZIP=$(find . -maxdepth 1 -type f -name '*.zip' | head -n 1)
+          mapfile -t ZIPS < <(
+            find . -maxdepth 1 -type f -iname '*.zip'
+          )
 
-          if [ -z "$ZIP" ]; then
-            echo "ERROR: No ZIP file found!"
+          if [ "${#ZIPS[@]}" -ne 1 ]; then
+            echo "ERROR: Expected exactly one project ZIP."
+            printf '%s\n' "${ZIPS[@]}"
             exit 1
           fi
 
-          echo "Found archive: $ZIP"
+          ZIP="${ZIPS[0]}"
+          echo "Extracting: $ZIP"
 
           mkdir -p project
           unzip -o "$ZIP" -d project
 
-          SETTINGS=$(find project -name settings.gradle.kts -print -quit)
+          SETTINGS=$(find project \
+            -name settings.gradle.kts \
+            -print -quit)
 
           if [ -z "$SETTINGS" ]; then
             echo "ERROR: settings.gradle.kts not found!"
@@ -49,7 +56,7 @@ jobs:
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-          echo "Android project found:"
+          echo "Project directory: $PROJECT_DIR"
           ls -la "$PROJECT_DIR"
 
       # 3. Java 17
@@ -59,7 +66,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # 4. Gradle 8.9
+      # 4. Gradle
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -69,41 +76,79 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      # 6. Install required Android packages
+      # 6. Install SDK packages
       - name: Install Android SDK packages
         run: |
           sdkmanager --install \
+            "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
 
-      # 7. Compile application
+      # 7. Build with automatic retries
       - name: Build NEXUS Debug APK
+        shell: bash
         run: |
-          gradle \
-            --no-daemon \
-            --stacktrace \
-            -p "$PROJECT_DIR" \
-            assembleDebug
+          set +e
 
-      # 8. Find APK
+          for attempt in 1 2 3 4; do
+
+            echo "================================"
+            echo "NEXUS BUILD ATTEMPT $attempt / 4"
+            echo "================================"
+
+            gradle \
+              --no-daemon \
+              --stacktrace \
+              --max-workers=2 \
+              -p "$PROJECT_DIR" \
+              assembleDebug
+
+            RESULT=$?
+
+            if [ "$RESULT" -eq 0 ]; then
+              echo "BUILD SUCCESSFUL"
+              exit 0
+            fi
+
+            if [ "$attempt" -lt 4 ]; then
+              WAIT=$((30 * attempt * attempt))
+              echo "Build failed. Waiting ${WAIT}s before retry..."
+              sleep "$WAIT"
+            fi
+
+          done
+
+          echo "ERROR: All build attempts failed."
+          exit 1
+
+      # 8. Verify APK
       - name: Verify APK
+        shell: bash
         run: |
+          set -euo pipefail
+
+          mkdir -p artifacts
+
           APK=$(find "$PROJECT_DIR" \
+            -type f \
             -path '*/build/outputs/apk/debug/*.apk' \
-            -type f | head -n 1)
+            -print -quit)
 
           if [ -z "$APK" ]; then
-            echo "ERROR: APK was not generated!"
+            echo "ERROR: APK not found!"
             exit 1
           fi
 
-          echo "APK successfully generated: $APK"
+          cp "$APK" artifacts/NEXUS-1.2.0-debug.apk
+
+          echo "APK successfully generated!"
+          ls -lh artifacts/
 
       # 9. Upload APK
       - name: Upload NEXUS APK
         uses: actions/upload-artifact@v4
         with:
           name: NEXUS-1.2.0-debug
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          path: artifacts/NEXUS-1.2.0-debug.apk
           if-no-files-found: error
           retention-days: 14
